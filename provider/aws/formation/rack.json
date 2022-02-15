@@ -3,6 +3,8 @@
   "Conditions": {
     "ApiRouterALB": { "Fn::Equals": [ { "Ref": "ApiRouter" }, "ALB" ] },
     "ApiRouterELB": { "Fn::Equals": [ { "Ref": "ApiRouter" }, "ELB" ] },
+    "ApiRouterELBorNLB": { "Fn::Or": [ { "Condition": "ApiRouterELB" }, { "Condition": "ApiRouterNLB" } ] },
+    "ApiRouterNLB": { "Fn::Equals": [ { "Ref": "ApiRouter" }, "NLB" ] },
     "Autoscale": { "Fn::Equals": [ { "Ref": "Autoscale" }, "Yes" ] },
     "BlankAmi": { "Fn::Equals": [ { "Ref": "Ami" }, "" ] },
     "BlankAvailabilityZones": { "Fn::Equals": [ { "Fn::Join": [ "", { "Ref": "AvailabilityZones" } ] }, "" ] },
@@ -1274,6 +1276,15 @@
               "convox.site"
             ] ] },
             { "Fn::GetAtt": [ "Balancer", "DNSName" ] }
+          ] },
+          { "Fn::If": [ "ApiRouterNLB",
+            { "Fn::Join": [ ".", [
+              "rack",
+              { "Fn::Select": [ 0, { "Fn::Split": [ ".", { "Fn::GetAtt": [ "Router", "DNSName" ] } ] } ] },
+              { "Fn::Select": [ 1, { "Fn::Split": [ ".", { "Fn::GetAtt": [ "Router", "DNSName" ] } ] } ] },
+              "convox.site"
+            ] ] },
+            { "Fn::GetAtt": [ "BalancerNetwork", "DNSName" ] }
           ] }
         ]
       }
@@ -2422,6 +2433,18 @@
         "SslPolicy": { "Fn::If": [ "BlankSslPolicy", { "Ref": "AWS::NoValue" }, { "Ref": "SslPolicy" } ] }
       }
     },
+    "RouterNetworkListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Condition": "ApiRouterNLB",
+      "Properties": {
+        "Certificates": [ { "CertificateArn": { "Ref": "RouterApiCertificate" } } ],
+        "DefaultActions": [ { "Type": "fixed-response", "FixedResponseConfig": { "StatusCode": "404", "MessageBody": "unknown host" } } ],
+        "LoadBalancerArn": { "Ref" : "BalancerNetwork" },
+        "Port": "443",
+        "Protocol": "TLS",
+        "SslPolicy": { "Fn::If": [ "BlankSslPolicy", { "Ref": "AWS::NoValue" }, { "Ref": "SslPolicy" } ] }
+      }
+    },
     "RouterApiCertificate": {
       "Type": "AWS::CertificateManager::Certificate",
       "Condition": "PublicRouter",
@@ -2464,6 +2487,25 @@
         "VpcId": { "Fn::If": [ "BlankExistingVpc", { "Ref": "Vpc" }, { "Ref": "ExistingVpc" } ] }
       }
     },
+    "RouterApiNetworkTargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Condition": "ApiRouterNLB",
+      "Properties": {
+        "HealthCheckIntervalSeconds": "10",
+        "HealthCheckTimeoutSeconds": "10",
+        "HealthyThresholdCount": "2",
+        "UnhealthyThresholdCount": "2",
+        "HealthCheckPath": "/check",
+        "Matcher": { "HttpCode": "200" },
+        "Port": "3000",
+        "Protocol": "TCP",
+        "TargetGroupAttributes": [
+          { "Key": "deregistration_delay.timeout_seconds", "Value": "30" }
+        ],
+        "TargetType": "instance",
+        "VpcId": { "Fn::If": [ "BlankExistingVpc", { "Ref": "Vpc" }, { "Ref": "ExistingVpc" } ] }
+      }
+    },
     "RouterApiListenerRule": {
       "Type": "AWS::ElasticLoadBalancingV2::ListenerRule",
       "Condition": "ApiRouterALB",
@@ -2478,6 +2520,23 @@
           ] ] } ] }
         ],
         "ListenerArn": { "Ref": "RouterListener443" },
+        "Priority": "1"
+      }
+    },
+    "RouterApiNetworkListenerRule": {
+      "Type": "AWS::ElasticLoadBalancingV2::ListenerRule",
+      "Condition": "ApiRouterNLB",
+      "Properties": {
+        "Actions": [ { "Type": "forward", "TargetGroupArn": { "Ref": "RouterApiNetworkTargetGroup" } } ],
+        "Conditions": [
+          { "Field": "host-header", "Values": [ { "Fn::Join": [ ".", [
+            "rack",
+            { "Fn::Select": [ 0, { "Fn::Split": [ ".", { "Fn::GetAtt": [ "Router", "DNSName" ] } ] } ] },
+            { "Fn::Select": [ 1, { "Fn::Split": [ ".", { "Fn::GetAtt": [ "Router", "DNSName" ] } ] } ] },
+            "convox.site"
+          ] ] } ] }
+        ],
+        "ListenerArn": { "Ref": "RouterNetworkListener" },
         "Priority": "1"
       }
     },
@@ -2611,7 +2670,7 @@
     },
     "BalancerSecurity": {
       "Type": "AWS::EC2::SecurityGroup",
-      "Condition": "ApiRouterELB",
+      "Condition": "ApiRouterELBorNLB",
       "Properties": {
         "GroupDescription": { "Fn::Sub": "${AWS::StackName} balancer" },
         "SecurityGroupIngress": [
@@ -2639,6 +2698,26 @@
         "VpcId": { "Fn::If": [ "BlankExistingVpc", { "Ref": "Vpc" }, { "Ref": "ExistingVpc" } ] }
       }
     },
+    "BalancerNetwork": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Condition": "ApiRouterNLB",
+      "Properties": {
+        "Name": { "Fn::If": [ "PrivateApi", { "Fn::Join": [ "-", [ { "Ref": "AWS::StackName" }, "i" ] ] }, { "Ref": "AWS::StackName" } ] },
+        "Scheme": { "Fn::If": [ "PrivateApi", "internal", { "Ref": "AWS::NoValue" } ] },
+        "SecurityGroups": [ { "Ref": "BalancerSecurity" } ],
+        "Subnets": {
+          "Fn::If": [ "PrivateApi",
+            [ { "Ref": "SubnetPrivate0" }, { "Ref": "SubnetPrivate1" }, { "Fn::If": [ "ThirdAvailabilityZoneAndHighAvailability", { "Ref": "SubnetPrivate2" }, { "Ref": "AWS::NoValue" } ] } ],
+            [ { "Ref": "Subnet0" }, { "Ref": "Subnet1" }, { "Fn::If": [ "ThirdAvailabilityZoneAndHighAvailability", { "Ref": "Subnet2" }, { "Ref": "AWS::NoValue" } ] } ]
+          ]
+        },
+        "Tags": [
+          { "Key": "GatewayAttachment", "Value": { "Fn::If": [ "ExistingVpc", "existing", { "Ref": "GatewayAttachment" } ] } },
+          { "Key": "Name", "Value": { "Ref": "AWS::StackName" } }
+        ],
+        "Type": "network"
+      }
+    },    
     "Cluster": {
       "Type": "AWS::ECS::Cluster",
       "Properties": {
@@ -2748,7 +2827,12 @@
         "LoadBalancers": [ { "Fn::If": [ "ApiRouterALB",
           { "ContainerName": "web", "ContainerPort": "5443", "TargetGroupArn": { "Ref": "RouterApiTargetGroup" } },
           { "ContainerName": "web", "ContainerPort": "5443", "LoadBalancerName": { "Ref": "Balancer" } }
-        ] } ],
+        ] },
+        { "Fn::If": [ "ApiRouterNLB",
+          { "ContainerName": "web", "ContainerPort": "3000", "TargetGroupArn": { "Ref": "RouterApiNetworkTargetGroup" } },
+          { "ContainerName": "web", "ContainerPort": "3000", "LoadBalancerName": { "Ref": "BalancerNetwork" } }
+        ] }
+       ],
         "Role": { "Fn::GetAtt": [ "ServiceRole", "Arn" ] },
         "TaskDefinition": { "Ref": "ApiWebTasks" }
       }
